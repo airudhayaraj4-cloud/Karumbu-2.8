@@ -1,0 +1,347 @@
+name: Build Android APK (கரும்பு 2)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Generate Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare Web Assets
+        run: |
+          # If a zip archive was uploaded, extract it automatically
+          if ls *.zip 1> /dev/null 2>&1; then
+            echo "Extracting zip archive..."
+            unzip -o *.zip
+          fi
+
+          # If the user downloaded index.html multiple times on phone, detect index (1).html, karumbu-kanakku-standalone.html etc.
+          for f in index\ \(*\).html index_*.html karumbu-kanakku-standalone*.html; do
+            if [ -f "$f" ]; then
+              echo "Detected renamed file $f, copying to index.html..."
+              cp -f "$f" index.html
+            fi
+          done
+
+          mkdir -p www
+          STANDALONE_USED=false
+
+          # 1. PRIORITY CHECK: Ensure candidate is real standalone bundle (> 100KB), not small cookie redirect
+          for candidate in "index.html" "offline-apk/index.html" "public/offline-apk/index.html" "karumbu-kanakku-standalone.html"; do
+            if [ -f "$candidate" ]; then
+              FILE_SIZE=$(wc -c < "$candidate")
+              if [ "$FILE_SIZE" -gt 100000 ] && [ "$STANDALONE_USED" = false ]; then
+                echo ">> SUCCESS: Found valid standalone app bundle in $candidate ($FILE_SIZE bytes). Using directly for APK!"
+                cp -f "$candidate" www/index.html
+                STANDALONE_USED=true
+              elif [ "$FILE_SIZE" -le 100000 ]; then
+                echo ">> WARNING: '$candidate' is too small ($FILE_SIZE bytes, likely incomplete download or cookie redirect). Discarding it..."
+                rm -f "$candidate"
+              fi
+            fi
+          done
+
+          # 2. If no valid standalone HTML found, compile freshly from source code
+          if [ "$STANDALONE_USED" = false ]; then
+            if [ -f "package.json" ] && [ -d "src" ]; then
+              echo ">> Full project repository detected. Running npm install & npm run build from source..."
+              npm install --legacy-peer-deps
+              npm run build
+              if [ -d "dist" ]; then
+                cp -r dist/* www/
+              fi
+              if [ -f "dist/offline-apk/index.html" ]; then
+                cp -f dist/offline-apk/index.html www/index.html
+              fi
+              STANDALONE_USED=true
+            elif [ -d "dist/assets" ] && [ -f "dist/index.html" ]; then
+              echo ">> Dist assets found, copying to www..."
+              cp -r dist/* www/
+              STANDALONE_USED=true
+            fi
+          fi
+
+          # Final verification
+          if [ ! -f "www/index.html" ] || grep -qi "cookie_check" www/index.html 2>/dev/null; then
+            echo "ERROR: www/index.html is missing or invalid! Checking fallbacks..."
+            if [ -f "public/offline-apk/index.html" ]; then
+              cp -f public/offline-apk/index.html www/index.html
+            fi
+          fi
+
+          # Copy assets if present
+          if [ -d "assets" ]; then
+            cp -r assets www/
+          fi
+
+          [ -f manifest.json ] && cp manifest.json www/manifest.json || true
+          [ -f pwa-192x192.png ] && cp pwa-192x192.png www/pwa-192x192.png || true
+          [ -f pwa-512x512.png ] && cp pwa-512x512.png www/pwa-512x512.png || true
+          [ -f pwa-maskable-512x512.png ] && cp pwa-maskable-512x512.png www/pwa-maskable-512x512.png || true
+          [ -f icon.svg ] && cp icon.svg www/icon.svg || true
+          [ -f apple-touch-icon.png ] && cp apple-touch-icon.png www/apple-touch-icon.png || true
+
+      - name: Initialize Capacitor Android Project
+        run: |
+          npm init -y
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest @capacitor/share@latest @capacitor/filesystem@latest
+          if [ ! -f "capacitor.config.json" ]; then
+            cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.karumbukanakku.app2",
+            "appName": "கரும்பு 2",
+            "webDir": "www",
+            "bundledWebRuntime": false,
+            "server": {
+              "androidScheme": "https",
+              "cleartext": true
+            },
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": 1500,
+                "launchAutoHide": true,
+                "backgroundColor": "#14532d",
+                "showSpinner": false
+              }
+            }
+          }
+          EOF
+          fi
+          npx cap add android
+          MA=$(find android/app/src/main/java -name MainActivity.java | head -n 1)
+          PKG=$(grep -m1 '^package ' "$MA" | sed 's/package \(.*\);/\1/')
+          echo "Patching $MA (package $PKG) to add native Print"
+          cat > "$MA" << JAVAEOF
+          package $PKG;
+
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.print.PrintAttributes;
+          import android.print.PrintDocumentAdapter;
+          import android.print.PrintManager;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import androidx.activity.result.ActivityResult;
+          import androidx.activity.result.ActivityResultCallback;
+          import androidx.activity.result.ActivityResultLauncher;
+          import androidx.activity.result.contract.ActivityResultContracts;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.BridgeActivity;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import org.json.JSONObject;
+
+          public class MainActivity extends BridgeActivity {
+            private ActivityResultLauncher<Intent> saveLauncher;
+            private byte[] pendingData;
+            private WebView wv;
+
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              wv = getBridge().getWebView();
+              saveLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), new ActivityResultCallback<ActivityResult>() {
+                @Override
+                public void onActivityResult(ActivityResult result) {
+                  boolean ok = false;
+                  String msg = "cancel";
+                  Intent data = result.getData();
+                  if (result.getResultCode() == RESULT_OK && data != null && data.getData() != null && pendingData != null) {
+                    try {
+                      OutputStream os = getContentResolver().openOutputStream(data.getData());
+                      os.write(pendingData);
+                      os.close();
+                      ok = true;
+                      msg = "ok";
+                    } catch (Exception e) {
+                      msg = String.valueOf(e.getMessage());
+                    }
+                  }
+                  pendingData = null;
+                  final String js = "window.__karumbuSaved&&window.__karumbuSaved(" + ok + "," + JSONObject.quote(msg) + ")";
+                  wv.post(new Runnable() {
+                    @Override
+                    public void run() {
+                      wv.evaluateJavascript(js, null);
+                    }
+                  });
+                }
+              });
+              wv.addJavascriptInterface(new NativeApi(), "AndroidNative");
+            }
+
+            public class NativeApi {
+              @JavascriptInterface
+              public void print() {
+                MainActivity.this.runOnUiThread(new Runnable() {
+                  @Override
+                  public void run() {
+                    PrintManager pm = (PrintManager) MainActivity.this.getSystemService(Context.PRINT_SERVICE);
+                    PrintDocumentAdapter adapter = wv.createPrintDocumentAdapter("Karumbu");
+                    pm.print("Karumbu", adapter, new PrintAttributes.Builder().build());
+                  }
+                });
+              }
+
+              @JavascriptInterface
+              public boolean saveFile(String name, String mime, String b64) {
+                try {
+                  pendingData = Base64.decode(b64, Base64.DEFAULT);
+                  final Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType(mime);
+                  i.putExtra(Intent.EXTRA_TITLE, name);
+                  MainActivity.this.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                      saveLauncher.launch(i);
+                    }
+                  });
+                  return true;
+                } catch (Exception e) {
+                  pendingData = null;
+                  return false;
+                }
+              }
+
+              @JavascriptInterface
+              public boolean sendImage(String phone, String b64, String name, String text) {
+                try {
+                  byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
+                  File f = new File(getCacheDir(), "slip_" + System.currentTimeMillis() + ".png");
+                  FileOutputStream fo = new FileOutputStream(f);
+                  fo.write(bytes);
+                  fo.close();
+                  Uri uri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".fileprovider", f);
+                  String digits = phone == null ? "" : phone.replaceAll("[^0-9]", "");
+                  if (digits.length() == 10) digits = "91" + digits;
+                  String[] pkgs = new String[] { "com.whatsapp", "com.whatsapp.w4b" };
+                  for (String p : pkgs) {
+                    Intent i = new Intent(Intent.ACTION_SEND);
+                    i.setType("image/png");
+                    i.putExtra(Intent.EXTRA_STREAM, uri);
+                    if (text != null && text.length() > 0) i.putExtra(Intent.EXTRA_TEXT, text);
+                    if (digits.length() > 0) i.putExtra("jid", digits + "@s.whatsapp.net");
+                    i.setPackage(p);
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    try {
+                      MainActivity.this.startActivity(i);
+                      return true;
+                    } catch (ActivityNotFoundException e) {
+                    }
+                  }
+                } catch (Exception e) {
+                }
+                return false;
+              }
+
+              @JavascriptInterface
+              public boolean sendFiles(String phone, String b64, String name, String text) {
+                try {
+                  String nm = name == null ? "" : name.toLowerCase();
+                  boolean pdf = nm.endsWith(".pdf");
+                  String mime = pdf ? "application/pdf" : "image/png";
+                  String ext = pdf ? ".pdf" : ".png";
+                  String[] parts = b64.split("[|]");
+                  java.util.ArrayList<Uri> uris = new java.util.ArrayList<Uri>();
+                  for (int k = 0; k < parts.length; k++) {
+                    if (parts[k].length() == 0) continue;
+                    byte[] bytes = Base64.decode(parts[k], Base64.DEFAULT);
+                    String fname = "slip_" + System.currentTimeMillis() + "_" + k + ext;
+                    if (pdf && name != null && name.length() > 4) {
+                      String bn = name.replace('/', '_').replace(' ', '_').replace(':', '_').replace('?', '_').replace('*', '_').replace('<', '_').replace('>', '_').replace('|', '_');
+                      if (bn.length() > 4) fname = bn;
+                    }
+                    File f = new File(getCacheDir(), fname);
+                    FileOutputStream fo = new FileOutputStream(f);
+                    fo.write(bytes);
+                    fo.close();
+                    uris.add(FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".fileprovider", f));
+                  }
+                  if (uris.size() == 0) return false;
+                  String digits = phone == null ? "" : phone.replaceAll("[^0-9]", "");
+                  if (digits.length() == 10) digits = "91" + digits;
+                  String[] pkgs = new String[] { "com.whatsapp", "com.whatsapp.w4b" };
+                  for (String p : pkgs) {
+                    Intent i;
+                    if (uris.size() == 1) {
+                      i = new Intent(Intent.ACTION_SEND);
+                      i.setType(mime);
+                      i.putExtra(Intent.EXTRA_STREAM, uris.get(0));
+                    } else {
+                      i = new Intent(Intent.ACTION_SEND_MULTIPLE);
+                      i.setType(mime);
+                      i.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+                    }
+                    if (text != null && text.length() > 0) {
+                      if (uris.size() > 1) {
+                        java.util.ArrayList<CharSequence> caps = new java.util.ArrayList<CharSequence>();
+                        for (int q = 0; q < uris.size(); q++) caps.add(q == uris.size() - 1 ? text : "");
+                        i.putCharSequenceArrayListExtra(Intent.EXTRA_TEXT, caps);
+                      } else {
+                        i.putExtra(Intent.EXTRA_TEXT, text);
+                      }
+                    }
+                    if (digits.length() > 0) i.putExtra("jid", digits + "@s.whatsapp.net");
+                    i.setPackage(p);
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    try {
+                      MainActivity.this.startActivity(i);
+                      return true;
+                    } catch (ActivityNotFoundException e) {
+                    }
+                  }
+                } catch (Exception e) {
+                }
+                return false;
+              }
+            }
+          }
+          JAVAEOF
+          npx cap sync android
+
+      - name: Build Debug Android APK
+        run: |
+          cd android
+          chmod +x ./gradlew
+          RUN_NUM="${{ github.run_number }}"
+          V_CODE=$((200 + RUN_NUM))
+          V_NAME="1.4.${RUN_NUM}"
+          echo "Building APK with versionCode=${V_CODE} and versionName=${V_NAME}..."
+          ./gradlew assembleDebug -PversionCode=${V_CODE} -PversionName="${V_NAME}" --no-daemon
+
+      - name: Prepare APK Output
+        run: |
+          mkdir -p apk-output
+          cp android/app/build/outputs/apk/debug/app-debug.apk apk-output/Karumbu-Kanakku2.apk
+          echo "APK successfully built: $(ls -lh apk-output/Karumbu-Kanakku2.apk)"
+
+      - name: Upload APK as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Karumbu-Kanakku2-Android-APK
+          path: apk-output/Karumbu-Kanakku2.apk
+          retention-days: 30
