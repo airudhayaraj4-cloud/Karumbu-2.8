@@ -110,7 +110,7 @@ window.__kSave=function(hk,v){if(!hk||hk==='new')return;try{var m=ld();if(v)m[hk
       if(!started)res({ok:false,msg:'start failed'});
     })});
   };
-  window.__karumbuSplit=function(src){return new Promise(function(res){
+  window.__karumbuSplit=function(src,cap){return new Promise(function(res){
     var im=new Image();
     im.onload=function(){try{
       var w=im.width,h=im.height,Wt=Math.min(w,1600),k=Wt/w;
@@ -125,6 +125,7 @@ window.__kSave=function(hk,v){if(!hk||hk==='new')return;try{var m=ld();if(v)m[hk
         var oc=document.createElement('canvas');oc.width=Wt;oc.height=Math.max(1,Math.round((end-pos)*k));
         var ox=oc.getContext('2d');ox.fillStyle='#fff';ox.fillRect(0,0,oc.width,oc.height);
         ox.drawImage(c,0,pos,w,end-pos,0,0,Wt,oc.height);
+        if(end>=h&&cap){var F=Math.round(Wt/12),o2=document.createElement('canvas');o2.width=Wt;o2.height=oc.height+F;var x2=o2.getContext('2d');x2.fillStyle='#fff';x2.fillRect(0,0,Wt,o2.height);x2.drawImage(oc,0,0);x2.fillStyle='#14532d';x2.fillRect(Math.round(Wt*0.04),oc.height+2,Math.round(Wt*0.92),2);var fs=Math.round(Wt/24);x2.font='bold '+fs+'px sans-serif';while(fs>10&&x2.measureText(cap).width>Wt*0.94){fs-=1;x2.font='bold '+fs+'px sans-serif'}x2.textAlign='center';x2.textBaseline='middle';x2.fillText(cap,Wt/2,oc.height+F/2+2);oc=o2}
         var u=oc.toDataURL('image/png');parts.push(u.slice(u.indexOf(',')+1));
         pos=end;
       }
@@ -135,14 +136,17 @@ window.__kSave=function(hk,v){if(!hk||hk==='new')return;try{var m=ld();if(v)m[hk
   })};
   window.__karumbuWA=async function(src,name,phone,text){
     if(!(window.AndroidNative&&window.AndroidNative.sendImage))return false;
+    var cap='';
     if(/PDF கோப்பு பார்க்கவும்\)\s*$/.test(String(text||'')))text=String(text).split('\n')[0];
+    else if(/Table படம் பார்க்கவும்\)\s*$/.test(String(text||''))){cap=String(text).split('\n')[0].replace(/\*/g,'');}
     try{
       var nw=typeof window.AndroidNative.sendFiles==='function',pdf=/\.pdf$/i.test(String(name||''));
       if(pdf&&!nw)return false;
       var d;
       if(String(src).indexOf('data:')===0){
-        d=(nw&&/\.png$/i.test(String(name||'')))?await window.__karumbuSplit(src):String(src).slice(String(src).indexOf(',')+1);
+        d=(nw&&/\.png$/i.test(String(name||'')))?await window.__karumbuSplit(src,cap):String(src).slice(String(src).indexOf(',')+1);
       }else d=await b64(await (await fetch(src)).blob());
+      if(nw&&d.indexOf('|')>=0)text='';
       return !!(nw?window.AndroidNative.sendFiles(String(phone||''),d,String(name||'slip.png'),String(text||'')):window.AndroidNative.sendImage(String(phone||''),d,String(name||'slip.png'),String(text||'')));
     }catch(e){return false}
   };
